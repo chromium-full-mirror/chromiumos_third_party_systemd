@@ -1994,62 +1994,178 @@ static int glob_item_recursively(Item *i, fdaction_t action) {
         return r;
 }
 
-static int rm_if_wrong_type(mode_t mode, const char *path, bool follow) {
+static int rm_if_wrong_type_safe(
+                mode_t mode,
+                int parent_fd,
+                const struct stat *parent_st /* Only used if follow is true. */,
+                const char *name,
+                int flags) {
+        _cleanup_free_ char *parent_name = NULL;
+        bool follow_links = !FLAGS_SET(flags, AT_SYMLINK_NOFOLLOW);
         struct stat st;
         int r;
 
-        assert(path);
+        assert(name);
         assert((mode & ~S_IFMT) == 0);
-        log_debug("Checking type of %s", path);
+        assert(!follow_links || parent_st);
+        assert((flags & ~AT_SYMLINK_NOFOLLOW) == 0);
 
-        if (follow)
-                r = stat(path, &st);
-        else
-                r = lstat(path, &st);
+        if (!filename_is_valid(name))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "\"%s\" is not a valid filename.", name);
+
+        r = fstatat_harder(parent_fd, name, &st, flags, REMOVE_CHMOD | REMOVE_CHMOD_RESTORE);
         if (r < 0) {
-                if (errno != ENOENT) {
-                        log_error_errno(r, "stat(%s): %m", path);
-                }
-                return -errno;
+                (void) fd_get_path(parent_fd, &parent_name);
+                return log_full_errno(r == -ENOENT? LOG_DEBUG : LOG_ERR, r,
+                              "Failed to stat \"%s\" at \"%s\": %m", name, strna(parent_name));
+        }
+
+        /* Fail before removing anything if this is an unsafe transition. */
+        if (follow_links && unsafe_transition(parent_st, &st)) {
+                (void) fd_get_path(parent_fd, &parent_name);
+                return log_error_errno(SYNTHETIC_ERRNO(ENOLINK),
+                                "Unsafe transition from \"%s\" to \"%s\".", parent_name, name);
         }
 
         if ((st.st_mode & S_IFMT) == mode)
                 return 0;
 
-        log_warning("wrong file type 0x%x; rm -rf \"%s\"", st.st_mode & S_IFMT, path);
-        r = rm_rf(path, REMOVE_ROOT|REMOVE_SUBVOLUME|REMOVE_PHYSICAL);
-        if (r < 0) {
-                if (errno != ENOENT) {
-                        log_error_errno(r, "rm_rf(%s): %m", path);
-                }
-                return -errno;
+        (void) fd_get_path(parent_fd, &parent_name);
+        log_notice("Wrong file type 0x%x; rm -rf \"%s/%s\"", st.st_mode & S_IFMT, strna(parent_name), name);
+
+        /* If the target of the symlink was the wrong type, the link needs to be removed instead of the
+         * target, so make sure it is identified as a link and not a directory. */
+        if (follow_links) {
+                r = fstatat_harder(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW, REMOVE_CHMOD | REMOVE_CHMOD_RESTORE);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to stat \"%s\" at \"%s\": %m", name, strna(parent_name));
         }
 
-        return 0;
+        /* Do not remove mount points. */
+        r = fd_is_mount_point(parent_fd, name, follow_links ? AT_SYMLINK_FOLLOW : 0);
+        if (r < 0)
+                (void) log_warning_errno(r, "Failed to check if  \"%s/%s\" is a mount point: %m; Continuing",
+                                strna(parent_name), name);
+        else if (r > 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBUSY),
+                                "Not removing  \"%s/%s\" because it is a mount point.", strna(parent_name), name);
+
+        if ((st.st_mode & S_IFMT) == S_IFDIR) {
+                _cleanup_close_ int child_fd = -1;
+
+                child_fd = openat(parent_fd, name, O_NOCTTY | O_CLOEXEC | O_DIRECTORY);
+                if (child_fd < 0)
+                        return log_error_errno(errno, "Failed to open \"%s\" at \"%s\": %m", name, strna(parent_name));
+
+                r = rm_rf_children(TAKE_FD(child_fd), REMOVE_ROOT|REMOVE_SUBVOLUME|REMOVE_PHYSICAL, &st);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to remove contents of \"%s\" at \"%s\": %m", name, strna(parent_name));
+
+                r = unlinkat_harder(parent_fd, name, AT_REMOVEDIR, REMOVE_CHMOD | REMOVE_CHMOD_RESTORE);
+        } else
+                r = unlinkat_harder(parent_fd, name, 0, REMOVE_CHMOD | REMOVE_CHMOD_RESTORE);
+        if (r < 0)
+                return log_error_errno(r, "Failed to remove \"%s\" at \"%s\": %m", name, strna(parent_name));
+
+        /* This is covered by the log_notice "Wrong file type..." It is logged earlier because it gives
+         * context to other error messages that might follow. */
+        return -ENOENT;
 }
 
-static int rm_nondir_parents(const char *path) {
-        char *p, *e;
-        int r = -ENOENT;
+/* If child_mode is non-zero, rm_if_wrong_type_safe will be executed for the last path component. */
+static int mkdir_parents_rm_if_wrong_type(mode_t child_mode, const char *path) {
+        _cleanup_close_ int parent_fd = -1, next_fd = -1;
+        _cleanup_free_ char *parent_name = NULL;
+        struct stat parent_st;
+        const char *s, *e;
+        int r;
+        size_t path_len;
 
         assert(path);
+        assert((child_mode & ~S_IFMT) == 0);
 
-        // Walk up the path components until one is found with the expected type or there are no more.
-        p = strdupa(path);
-        // If the path doesn't exist, check the next path component.
-        while (r == -ENOENT || r == -ENOTDIR) {
-                e = strrchr(p, '/');
-                if (!e)
-                        return 0;
+        path_len = strlen(path);
 
-                *e = 0;
-                r = rm_if_wrong_type(S_IFDIR, p, true);
-                // Remove dangling symlinks.
-                if (r == -ENOENT) {
-                        r = rm_if_wrong_type(S_IFDIR, p, false);
-                }
+        if (!is_path(path))
+                /* rm_if_wrong_type_safe already logs errors. */
+                return child_mode != 0 ? rm_if_wrong_type_safe(child_mode, AT_FDCWD, NULL, path, AT_SYMLINK_NOFOLLOW) : 0;
+
+        if (child_mode != 0 && endswith(path, "/"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                "Trailing path separators are only allowed if child_mode is not set; got \"%s\"", path);
+
+        /* Get the parent_fd and stat. */
+        parent_fd = AT_FDCWD;
+        if (path_is_absolute(path)) {
+                parent_fd = open("/", O_NOCTTY | O_CLOEXEC | O_DIRECTORY);
+                if (parent_fd < 0)
+                        return log_error_errno(errno, "Failed to open root: %m");
         }
-        return r;
+        if (fstat(parent_fd, &parent_st) < 0)
+                return log_error_errno(errno, "Failed to stat root: %m");
+
+        /* Check every parent directory in the path, except the last component */
+        e = path;
+        for (;;) {
+                char t[path_len + 1];
+
+                /* Find the start of the next path component. */
+                s = e + strspn(e, "/");
+                /* Find the end of the next path component. */
+                e = s + strcspn(s, "/");
+
+                /* Copy the path component to t so it can be a null terminated string. */
+                *((char*) mempcpy(t, s, e - s)) = 0;
+
+                /* Is this the last component? If so, then check the type */
+                if (*e == 0)
+                        return child_mode != 0 ? rm_if_wrong_type_safe(child_mode, parent_fd, &parent_st, t, AT_SYMLINK_NOFOLLOW) : 0;
+                else {
+                        r = rm_if_wrong_type_safe(S_IFDIR, parent_fd, &parent_st, t, 0);
+                        /* Remove dangling symlinks. */
+                        if (r == -ENOENT)
+                                r = rm_if_wrong_type_safe(S_IFDIR, parent_fd, &parent_st, t, AT_SYMLINK_NOFOLLOW);
+                }
+
+                if (r == -ENOENT) {
+                        RUN_WITH_UMASK(0000)
+                                r = mkdirat_label(parent_fd, t, 0755);
+                        if (r < 0) {
+                                (void) fd_get_path(parent_fd, &parent_name);
+                                return log_error_errno(r, "Failed to mkdir \"%s\" at \"%s\": %m", t, parent_name);
+                        }
+                } else if (r < 0)
+                        /* rm_if_wrong_type_safe already logs errors. */
+                        return r;
+
+                next_fd = openat(parent_fd, t, O_NOCTTY | O_CLOEXEC | O_DIRECTORY);
+                if (next_fd < 0) {
+                        r = -errno;
+                        (void) fd_get_path(parent_fd, &parent_name);
+                        return log_error_errno(r, "Failed to open \"%s\" at \"%s\": %m", t, parent_name);
+                }
+                if (fstat(next_fd, &parent_st) < 0) {
+                        r = -errno;
+                        (void) fd_get_path(parent_fd, &parent_name);
+                        return log_error_errno(r, "Failed to stat \"%s\" at \"%s\": %m", t, parent_name);
+                }
+
+                safe_close(parent_fd);
+                parent_fd = TAKE_FD(next_fd);
+        }
+}
+
+static int mkdir_parents_item(Item *i, mode_t child_mode) {
+        int r;
+        if (i->try_replace) {
+                r = mkdir_parents_rm_if_wrong_type(child_mode, i->path);
+                if (r < 0 && r != -ENOENT)
+                        return r;
+        } else
+                RUN_WITH_UMASK(0000)
+                        (void) mkdir_parents_label(i->path, 0755);
+
+        return 0;
 }
 
 static int create_item(Item *i) {
@@ -2070,20 +2186,9 @@ static int create_item(Item *i) {
 
         case TRUNCATE_FILE:
         case CREATE_FILE:
-                if (i->try_replace) {
-                        r = rm_nondir_parents(i->path);
-                        if (r < 0)
-                                return r;
-                }
-
-                RUN_WITH_UMASK(0000)
-                        (void) mkdir_parents_label(i->path, 0755);
-
-                if (i->try_replace) {
-                        r = rm_if_wrong_type(S_IFREG, i->path, false);
-                        if (r < 0 && r != -ENOENT)
-                                return r;
-                }
+                r = mkdir_parents_item(i, S_IFREG);
+                if (r < 0)
+                        return r;
 
                 if ((i->type == CREATE_FILE && i->append_or_force) || i->type == TRUNCATE_FILE)
                         r = truncate_file(i, i->path);
@@ -2095,14 +2200,9 @@ static int create_item(Item *i) {
                 break;
 
         case COPY_FILES:
-                if (i->try_replace) {
-                        r = rm_nondir_parents(i->path);
-                        if (r < 0)
-                                return r;
-                }
-
-                RUN_WITH_UMASK(0000)
-                        (void) mkdir_parents_label(i->path, 0755);
+                r = mkdir_parents_item(i, 0);
+                if (r < 0)
+                        return r;
 
                 r = copy_files(i);
                 if (r < 0)
@@ -2118,20 +2218,9 @@ static int create_item(Item *i) {
 
         case CREATE_DIRECTORY:
         case TRUNCATE_DIRECTORY:
-                if (i->try_replace) {
-                        r = rm_nondir_parents(i->path);
-                        if (r < 0)
-                                return r;
-                }
-
-                RUN_WITH_UMASK(0000)
-                        (void) mkdir_parents_label(i->path, 0755);
-
-                if (i->try_replace) {
-                        r = rm_if_wrong_type(S_IFDIR, i->path, false);
-                        if (r < 0 && r != -ENOENT)
-                                return r;
-                }
+                r = mkdir_parents_item(i, S_IFDIR);
+                if (r < 0)
+                        return r;
 
                 r = create_directory(i, i->path);
                 if (r < 0)
@@ -2141,20 +2230,9 @@ static int create_item(Item *i) {
         case CREATE_SUBVOLUME:
         case CREATE_SUBVOLUME_INHERIT_QUOTA:
         case CREATE_SUBVOLUME_NEW_QUOTA:
-                if (i->try_replace) {
-                        r = rm_nondir_parents(i->path);
-                        if (r < 0)
-                                return r;
-                }
-
-                RUN_WITH_UMASK(0000)
-                        (void) mkdir_parents_label(i->path, 0755);
-
-                if (i->try_replace) {
-                        r = rm_if_wrong_type(S_IFDIR, i->path, false);
-                        if (r < 0 && r != -ENOENT)
-                                return r;
-                }
+                r = mkdir_parents_item(i, S_IFDIR);
+                if (r < 0)
+                        return r;
 
                 r = create_subvolume(i, i->path);
                 if (r < 0)
@@ -2168,20 +2246,9 @@ static int create_item(Item *i) {
                 break;
 
         case CREATE_FIFO:
-                if (i->try_replace) {
-                        r = rm_nondir_parents(i->path);
-                        if (r < 0)
-                                return r;
-                }
-
-                RUN_WITH_UMASK(0000)
-                        (void) mkdir_parents_label(i->path, 0755);
-
-                if (i->try_replace) {
-                        r = rm_if_wrong_type(S_IFIFO, i->path, false);
-                        if (r < 0 && r != -ENOENT)
-                                return r;
-                }
+                r = mkdir_parents_item(i, S_IFIFO);
+                if (r < 0)
+                        return r;
 
                 r = create_fifo(i, i->path);
                 if (r < 0)
@@ -2189,20 +2256,9 @@ static int create_item(Item *i) {
                 break;
 
         case CREATE_SYMLINK: {
-                if (i->try_replace) {
-                        r = rm_nondir_parents(i->path);
-                        if (r < 0)
-                                return r;
-                }
-
-                RUN_WITH_UMASK(0000)
-                        (void) mkdir_parents_label(i->path, 0755);
-
-                if (i->try_replace) {
-                        r = rm_if_wrong_type(S_IFLNK, i->path, false);
-                        if (r < 0 && r != -ENOENT)
-                                return r;
-                }
+                r = mkdir_parents_item(i, S_IFLNK);
+                if (r < 0)
+                        return r;
 
                 mac_selinux_create_file_prepare(i->path, S_IFLNK);
                 r = symlink(i->argument, i->path);
@@ -2258,20 +2314,9 @@ static int create_item(Item *i) {
                         return 0;
                 }
 
-                if (i->try_replace) {
-                        r = rm_nondir_parents(i->path);
-                        if (r < 0)
-                                return r;
-                }
-
-                RUN_WITH_UMASK(0000)
-                        (void) mkdir_parents_label(i->path, 0755);
-
-                if (i->try_replace) {
-                        r = rm_if_wrong_type(i->type == CREATE_BLOCK_DEVICE ? S_IFBLK : S_IFCHR, i->path, false);
-                        if (r < 0 && r != -ENOENT)
-                                return r;
-                }
+                r = mkdir_parents_item(i, i->type == CREATE_BLOCK_DEVICE ? S_IFBLK : S_IFCHR);
+                if (r < 0)
+                        return r;
 
                 r = create_device(i, i->type == CREATE_BLOCK_DEVICE ? S_IFBLK : S_IFCHR);
                 if (r < 0)
